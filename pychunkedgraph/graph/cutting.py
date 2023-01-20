@@ -153,7 +153,7 @@ class LocalMincutGraph:
         self._check_connectedness()
 
     def _check_connectedness(self):
-        ccs = flatgraph.topology.label_components(self.weighted_graph)[0].a
+        ccs = flatgraph.connected_component_array(self.weighted_graph)[0].a
         all_points = np.concatenate([self.sources, self.sinks])
         if len(np.unique(ccs[all_points])) != 1:
             raise PreconditionError('Source and sink points must belong to the same local component')

@@ -46,15 +46,16 @@ def build_gt_graph(
 def remap_ids_from_graph(graph_ids, unique_ids):
     return unique_ids[graph_ids]
 
+def connected_component_array(graph):
+    assert isinstance(graph, Graph)
+    return topology.label_components(graph)[0].a
 
 def connected_components(graph):
     """Computes connected components of graph_tool graph
     :param graph: graph_tool.Graph
     :return: np.array of len == number of nodes
     """
-    assert isinstance(graph, Graph)
-
-    cc_labels = topology.label_components(graph)[0].a
+    cc_labels = connected_component_array(graph)
 
     if len(cc_labels) == 0:
         return []
