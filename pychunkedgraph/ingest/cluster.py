@@ -1,3 +1,5 @@
+# pylint: disable=invalid-name, missing-function-docstring, import-outside-toplevel
+
 """
 Ingest / create chunkedgraph with workers.
 """
@@ -18,87 +20,14 @@ from ..utils.redis import keys as r_keys
 from ..utils.redis import get_redis_connection
 
 
-def _post_task_completion(imanager: IngestionManager, layer: int, coords: np.ndarray):
-    from os import environ
-
+def _post_task_completion(
+    imanager: IngestionManager,
+    layer: int,
+    coords: np.ndarray,
+):
     chunk_str = "_".join(map(str, coords))
     # mark chunk as completed - "c"
     imanager.redis.sadd(f"{layer}c", chunk_str)
-
-    if environ.get("DO_NOT_AUTOQUEUE_PARENT_CHUNKS", None) is not None:
-        return
-
-    parent_layer = layer + 1
-    if parent_layer > imanager.cg_meta.layer_count:
-        return
-
-    parent_coords = np.array(coords, int) // imanager.cg_meta.graph_config.FANOUT
-    parent_id_str = chunk_id_str(parent_layer, parent_coords)
-    imanager.redis.sadd(parent_id_str, chunk_str)
-
-    parent_chunk_str = "_".join(map(str, parent_coords))
-    if not imanager.redis.hget(parent_layer, parent_chunk_str):
-        # cache children chunk count
-        # checked by tracker worker to enqueue parent chunk
-        children_count = len(
-            get_children_chunk_coords(imanager.cg_meta, parent_layer, parent_coords)
-        )
-        imanager.redis.hset(parent_layer, parent_chunk_str, children_count)
-
-    tracker_queue = imanager.get_task_queue(f"t{layer}")
-    tracker_queue.enqueue(
-        enqueue_parent_task,
-        job_id=f"t{layer}_{chunk_str}",
-        job_timeout=f"30s",
-        result_ttl=0,
-        args=(
-            parent_layer,
-            parent_coords,
-        ),
-    )
-
-
-def enqueue_parent_task(
-    parent_layer: int,
-    parent_coords: Sequence[int],
-):
-    redis = get_redis_connection()
-    imanager = IngestionManager.from_pickle(redis.get(r_keys.INGESTION_MANAGER))
-    parent_id_str = chunk_id_str(parent_layer, parent_coords)
-    parent_chunk_str = "_".join(map(str, parent_coords))
-
-    children_done = redis.scard(parent_id_str)
-    # if zero then this key was deleted and parent already queued.
-    if children_done == 0:
-        print("parent already queued.")
-        return
-
-    # if the previous layer is complete
-    # no need to check children progress for each parent chunk
-    child_layer = parent_layer - 1
-    child_layer_done = redis.scard(f"{child_layer}c")
-    child_layer_count = imanager.cg_meta.layer_chunk_counts[child_layer - 2]
-    child_layer_finished = child_layer_done == child_layer_count
-
-    if not child_layer_finished:
-        children_count = int(redis.hget(parent_layer, parent_chunk_str).decode("utf-8"))
-        if children_done != children_count:
-            print("children not done.")
-            return
-
-    queue = imanager.get_task_queue(f"l{parent_layer}")
-    queue.enqueue(
-        create_parent_chunk,
-        job_id=parent_id_str,
-        job_timeout=f"{int(parent_layer * parent_layer)}m",
-        result_ttl=0,
-        args=(
-            parent_layer,
-            parent_coords,
-        ),
-    )
-    redis.hdel(parent_layer, parent_chunk_str)
-    redis.delete(parent_id_str)
 
 
 def create_parent_chunk(
@@ -138,13 +67,13 @@ def enqueue_atomic_tasks(imanager: IngestionManager):
         atomic_chunk_bounds = imanager.cg_meta.layer_chunk_bounds[2]
         chunk_coords = randomize_grid_points(*atomic_chunk_bounds)
         chunk_count = imanager.cg_meta.layer_chunk_counts[0]
-
     print(f"total chunk count: {chunk_count}, queuing...")
-    batch_size = int(environ.get("L2JOB_BATCH_SIZE", 1000))
 
+    queue_name = f"{imanager.config.CLUSTER.ATOMIC_Q_NAME}"
+    q = imanager.get_task_queue(queue_name)
     job_datas = []
+    batch_size = int(environ.get("L2JOB_BATCH_SIZE", 1000))
     for chunk_coord in chunk_coords:
-        q = imanager.get_task_queue(imanager.config.CLUSTER.ATOMIC_Q_NAME)
         # buffer for optimal use of redis memory
         if len(q) > imanager.config.CLUSTER.ATOMIC_Q_LIMIT:
             print(f"Sleeping {imanager.config.CLUSTER.ATOMIC_Q_INTERVAL}s...")
@@ -157,7 +86,7 @@ def enqueue_atomic_tasks(imanager: IngestionManager):
             continue
         job_datas.append(
             RQueue.prepare_data(
-                _create_atomic_chunk,
+                create_atomic_chunk,
                 args=(chunk_coord,),
                 timeout=environ.get("L2JOB_TIMEOUT", "3m"),
                 result_ttl=0,
@@ -170,14 +99,16 @@ def enqueue_atomic_tasks(imanager: IngestionManager):
     q.enqueue_many(job_datas)
 
 
-def _create_atomic_chunk(coords: Sequence[int]):
+def create_atomic_chunk(coords: Sequence[int]):
     """Creates single atomic chunk"""
     redis = get_redis_connection()
     imanager = IngestionManager.from_pickle(redis.get(r_keys.INGESTION_MANAGER))
     coords = np.array(list(coords), dtype=int)
+
     chunk_edges_all, mapping = get_atomic_chunk_data(imanager, coords)
     chunk_edges_active, isolated_ids = get_active_edges(chunk_edges_all, mapping)
     add_atomic_edges(imanager.cg, coords, chunk_edges_active, isolated=isolated_ids)
+
     if imanager.config.TEST_RUN:
         # print for debugging
         for k, v in chunk_edges_all.items():

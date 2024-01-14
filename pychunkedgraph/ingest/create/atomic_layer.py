@@ -1,14 +1,14 @@
+# pylint: disable=invalid-name, missing-function-docstring, import-outside-toplevel
+
 """
 Functions for creating atomic nodes and their level 2 abstract parents
 """
 
 import datetime
 from typing import Dict
-from typing import List
 from typing import Optional
 from typing import Sequence
 
-import pytz
 import numpy as np
 
 from ...graph import attributes
@@ -101,7 +101,13 @@ def _get_remapping(chunk_edges_d: dict):
 
 
 def _process_component(
-    cg, chunk_edges_d, parent_id, node_ids, sparse_indices, remapping, time_stamp,
+    cg,
+    chunk_edges_d,
+    parent_id,
+    node_ids,
+    sparse_indices,
+    remapping,
+    time_stamp,
 ):
     nodes = []
     chunk_out_edges = []  # out = between + cross
@@ -120,7 +126,7 @@ def _process_component(
     for cc_layer in u_cce_layers:
         layer_out_edges = chunk_out_edges[cce_layers == cc_layer]
         if layer_out_edges.size:
-            col = attributes.Connectivity.CrossChunkEdge[cc_layer]
+            col = attributes.Connectivity.AtomicCrossChunkEdge[cc_layer]
             val_dict[col] = layer_out_edges
 
     r_key = serializers.serialize_uint64(parent_id)

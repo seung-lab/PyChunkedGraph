@@ -1,16 +1,16 @@
+# pylint: disable=invalid-name, missing-docstring, import-outside-toplevel, c-extension-no-member
+
 """
 Functions for creating parents in level 3 and above
 """
 
-import time
 import math
 import datetime
 import multiprocessing as mp
-from collections import defaultdict
 from typing import Optional
 from typing import Sequence
-from typing import List
 
+import fastremap
 import numpy as np
 from multiwrapper import multiprocessing_utils as mu
 
@@ -21,11 +21,12 @@ from ...graph.utils import flatgraph
 from ...graph.utils import basetypes
 from ...graph.utils import serializers
 from ...graph.chunkedgraph import ChunkedGraph
+from ...graph.edges.utils import concatenate_cross_edge_dicts
 from ...graph.utils.generic import get_valid_timestamp
 from ...graph.utils.generic import filter_failed_node_ids
 from ...graph.chunks.hierarchy import get_children_chunk_coords
-from ...graph.connectivity.cross_edges import get_children_chunk_cross_edges
-from ...graph.connectivity.cross_edges import get_chunk_nodes_cross_edge_layer
+from .cross_edges import get_children_chunk_cross_edges
+from .cross_edges import get_chunk_nodes_cross_edge_layer
 
 
 def add_layer(
@@ -40,39 +41,29 @@ def add_layer(
     if not children_coords.size:
         children_coords = get_children_chunk_coords(cg.meta, layer_id, parent_coords)
     children_ids = _read_children_chunks(cg, layer_id, children_coords, n_threads > 1)
-    edge_ids = get_children_chunk_cross_edges(
+    cx_edges = get_children_chunk_cross_edges(
         cg, layer_id, parent_coords, use_threads=n_threads > 1
     )
 
-    print("children_coords", children_coords.size, layer_id, parent_coords)
-    print(
-        "n e", len(children_ids), len(edge_ids), layer_id, parent_coords,
-    )
-
     node_layers = cg.get_chunk_layers(children_ids)
-    edge_layers = cg.get_chunk_layers(np.unique(edge_ids))
+    edge_layers = cg.get_chunk_layers(np.unique(cx_edges))
     assert np.all(node_layers < layer_id), "invalid node layers"
     assert np.all(edge_layers < layer_id), "invalid edge layers"
-    # Extract connected components
-    # isolated_node_mask = ~np.in1d(children_ids, np.unique(edge_ids))
-    # add_node_ids = children_ids[isolated_node_mask].squeeze()
-    add_edge_ids = np.vstack([children_ids, children_ids]).T
 
-    edge_ids = list(edge_ids)
-    edge_ids.extend(add_edge_ids)
-    graph, _, _, graph_ids = flatgraph.build_gt_graph(edge_ids, make_directed=True)
-    ccs = flatgraph.connected_components(graph)
-    print("ccs", len(ccs))
+    cx_edges = list(cx_edges)
+    cx_edges.extend(np.vstack([children_ids, children_ids]).T)  # add self-edges
+    graph, _, _, graph_ids = flatgraph.build_gt_graph(cx_edges, make_directed=True)
+    raw_ccs = flatgraph.connected_components(graph)  # connected components with indices
+    connected_components = [graph_ids[cc] for cc in raw_ccs]
+
     _write_connected_components(
         cg,
         layer_id,
         parent_coords,
-        ccs,
-        graph_ids,
+        connected_components,
         get_valid_timestamp(time_stamp),
         n_threads > 1,
     )
-    return f"{layer_id}_{'_'.join(map(str, parent_coords))}"
 
 
 def _read_children_chunks(
@@ -84,7 +75,6 @@ def _read_children_chunks(
             children_ids.append(_read_chunk([], cg, layer_id - 1, child_coord))
         return np.concatenate(children_ids)
 
-    print("_read_children_chunks")
     with mp.Manager() as manager:
         children_ids_shared = manager.list()
         multi_args = []
@@ -102,7 +92,6 @@ def _read_children_chunks(
             multi_args,
             n_threads=min(len(multi_args), mp.cpu_count()),
         )
-        print("_read_children_chunks done")
         return np.concatenate(children_ids_shared)
 
 
@@ -113,7 +102,6 @@ def _read_chunk_helper(args):
 
 
 def _read_chunk(children_ids_shared, cg: ChunkedGraph, layer_id: int, chunk_coord):
-    print(f"_read_chunk {layer_id}, {chunk_coord}")
     x, y, z = chunk_coord
     range_read = cg.range_read_chunk(
         cg.get_chunk_id(layer=layer_id, x=x, y=y, z=z),
@@ -129,55 +117,30 @@ def _read_chunk(children_ids_shared, cg: ChunkedGraph, layer_id: int, chunk_coor
 
     row_ids = filter_failed_node_ids(row_ids, segment_ids, max_children_ids)
     children_ids_shared.append(row_ids)
-    print(f"_read_chunk {layer_id}, {chunk_coord} done {len(row_ids)}")
     return row_ids
 
 
 def _write_connected_components(
-    cg: ChunkedGraph,
-    layer_id: int,
-    parent_coords,
-    ccs,
-    graph_ids,
-    time_stamp,
-    use_threads=True,
-) -> None:
-    if not ccs:
+    cg, layer, pcoords, components, time_stamp, use_threads=True
+):
+    if len(components) == 0:
         return
 
-    node_layer_d_shared = {}
-    if layer_id < cg.meta.layer_count:
-        print("getting node_layer_d_shared")
-        node_layer_d_shared = get_chunk_nodes_cross_edge_layer(
-            cg, layer_id, parent_coords, use_threads=use_threads
-        )
-
-    print("node_layer_d_shared", len(node_layer_d_shared))
-
-    ccs_with_node_ids = []
-    for cc in ccs:
-        ccs_with_node_ids.append(graph_ids[cc])
+    node_layer_d = {}
+    if layer < cg.meta.layer_count:
+        node_layer_d = get_chunk_nodes_cross_edge_layer(cg, layer, pcoords, use_threads)
 
     if not use_threads:
-        _write(
-            cg,
-            layer_id,
-            parent_coords,
-            ccs_with_node_ids,
-            node_layer_d_shared,
-            time_stamp,
-            use_threads=use_threads,
-        )
+        _write(cg, layer, pcoords, components, node_layer_d, time_stamp, use_threads)
         return
 
-    task_size = int(math.ceil(len(ccs_with_node_ids) / mp.cpu_count() / 10))
-    chunked_ccs = chunked(ccs_with_node_ids, task_size)
+    task_size = int(math.ceil(len(components) / mp.cpu_count() / 10))
+    chunked_ccs = chunked(components, task_size)
     cg_info = cg.get_serialized_info()
     multi_args = []
     for ccs in chunked_ccs:
-        multi_args.append(
-            (cg_info, layer_id, parent_coords, ccs, node_layer_d_shared, time_stamp)
-        )
+        args = (cg_info, layer, pcoords, ccs, node_layer_d, time_stamp)
+        multi_args.append(args)
     mu.multiprocess_func(
         _write_components_helper,
         multi_args,
@@ -186,21 +149,26 @@ def _write_connected_components(
 
 
 def _write_components_helper(args):
-    print("running _write_components_helper")
-    cg_info, layer_id, parent_coords, ccs, node_layer_d_shared, time_stamp = args
+    cg_info, layer, pcoords, ccs, node_layer_d, time_stamp = args
     cg = ChunkedGraph(**cg_info)
-    _write(cg, layer_id, parent_coords, ccs, node_layer_d_shared, time_stamp)
+    _write(cg, layer, pcoords, ccs, node_layer_d, time_stamp)
 
 
 def _write(
-    cg, layer_id, parent_coords, ccs, node_layer_d_shared, time_stamp, use_threads=True
+    cg: ChunkedGraph,
+    layer_id,
+    parent_coords,
+    components,
+    node_layer_d,
+    time_stamp,
+    use_threads=True,
 ):
-    parent_layer_ids = range(layer_id, cg.meta.layer_count + 1)
-    cc_connections = {l: [] for l in parent_layer_ids}
-    for node_ids in ccs:
+    parent_layers = range(layer_id, cg.meta.layer_count + 1)
+    cc_connections = {l: [] for l in parent_layers}
+    for node_ids in components:
         layer = layer_id
         if len(node_ids) == 1:
-            layer = node_layer_d_shared.get(node_ids[0], cg.meta.layer_count)
+            layer = node_layer_d.get(node_ids[0], cg.meta.layer_count)
         cc_connections[layer].append(node_ids)
 
     rows = []
@@ -208,40 +176,71 @@ def _write(
     parent_chunk_id = cg.get_chunk_id(layer=layer_id, x=x, y=y, z=z)
     parent_chunk_id_dict = cg.get_parent_chunk_id_dict(parent_chunk_id)
 
-    # Iterate through layers
-    for parent_layer_id in parent_layer_ids:
-        if len(cc_connections[parent_layer_id]) == 0:
+    for parent_layer in parent_layers:
+        if len(cc_connections[parent_layer]) == 0:
             continue
 
-        parent_chunk_id = parent_chunk_id_dict[parent_layer_id]
+        parent_chunk_id = parent_chunk_id_dict[parent_layer]
         reserved_parent_ids = cg.id_client.create_node_ids(
             parent_chunk_id,
-            size=len(cc_connections[parent_layer_id]),
-            root_chunk=parent_layer_id == cg.meta.layer_count and use_threads,
+            size=len(cc_connections[parent_layer]),
+            root_chunk=parent_layer == cg.meta.layer_count and use_threads,
         )
 
-        for i_cc, node_ids in enumerate(cc_connections[parent_layer_id]):
+        for i_cc, node_ids in enumerate(cc_connections[parent_layer]):
             parent_id = reserved_parent_ids[i_cc]
-            for node_id in node_ids:
-                rows.append(
-                    cg.client.mutate_row(
-                        serializers.serialize_uint64(node_id),
-                        {attributes.Hierarchy.Parent: parent_id},
-                        time_stamp=time_stamp,
+
+            if layer_id == 3:
+                # when layer 3 is being processed, children chunks are at layer 2
+                # layer 2 chunks at this time will only have atomic cross edges
+                cx_edges_d = cg.get_atomic_cross_edges(node_ids)
+            else:
+                # children are from abstract chunks
+                cx_edges_d = cg.get_cross_chunk_edges(node_ids, raw_only=True)
+
+            children_cx_edges = []
+            for node in node_ids:
+                node_layer = cg.get_chunk_layer(node)
+                row_id = serializers.serialize_uint64(node)
+                val_dict = {attributes.Hierarchy.Parent: parent_id}
+
+                node_cx_edges_d = cx_edges_d.get(node, {})
+                if not node_cx_edges_d:
+                    rows.append(cg.client.mutate_row(row_id, val_dict, time_stamp))
+                    continue
+
+                for layer in range(node_layer, cg.meta.layer_count):
+                    if not layer in node_cx_edges_d:
+                        continue
+                    layer_edges = node_cx_edges_d[layer]
+                    nodes = np.unique(layer_edges)
+                    parents = cg.get_roots(nodes, stop_layer=node_layer, ceil=False)
+
+                    edge_parents_d = dict(zip(nodes, parents))
+                    layer_edges = fastremap.remap(
+                        layer_edges, edge_parents_d, preserve_missing_labels=True
                     )
-                )
+                    layer_edges = np.unique(layer_edges, axis=0)
 
-            rows.append(
-                cg.client.mutate_row(
-                    serializers.serialize_uint64(parent_id),
-                    {attributes.Hierarchy.Child: node_ids},
-                    time_stamp=time_stamp,
-                )
+                    col = attributes.Connectivity.CrossChunkEdge[layer]
+                    val_dict[col] = layer_edges
+                    node_cx_edges_d[layer] = layer_edges
+                children_cx_edges.append(node_cx_edges_d)
+                rows.append(cg.client.mutate_row(row_id, val_dict, time_stamp))
+
+            row_id = serializers.serialize_uint64(parent_id)
+            val_dict = {attributes.Hierarchy.Child: node_ids}
+            parent_cx_edges_d = concatenate_cross_edge_dicts(
+                children_cx_edges, unique=True
             )
+            for layer in range(parent_layer, cg.meta.layer_count):
+                if not layer in parent_cx_edges_d:
+                    continue
+                col = attributes.Connectivity.CrossChunkEdge[layer]
+                val_dict[col] = parent_cx_edges_d[layer]
 
+            rows.append(cg.client.mutate_row(row_id, val_dict, time_stamp))
             if len(rows) > 100000:
                 cg.client.write(rows)
-                print("wrote rows", len(rows), layer_id, parent_coords)
                 rows = []
     cg.client.write(rows)
-    print("wrote rows", len(rows), layer_id, parent_coords)

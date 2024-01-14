@@ -1,11 +1,11 @@
-# pylint: disable=invalid-name, missing-docstring, import-outside-toplevel, line-too-long, protected-access, arguments-differ, arguments-renamed, logging-fstring-interpolation
+# pylint: disable=invalid-name, missing-docstring, import-outside-toplevel, line-too-long, protected-access, arguments-differ, arguments-renamed, logging-fstring-interpolation, too-many-arguments
 
 import sys
 import time
 import typing
 import logging
-import datetime
 from datetime import datetime
+from datetime import timedelta
 
 import numpy as np
 from multiwrapper import multiprocessing_utils as mu
@@ -15,11 +15,12 @@ from google.api_core.retry import if_exception_type
 from google.api_core.exceptions import Aborted
 from google.api_core.exceptions import DeadlineExceeded
 from google.api_core.exceptions import ServiceUnavailable
+from google.cloud.bigtable.column_family import MaxAgeGCRule
+from google.cloud.bigtable.column_family import MaxVersionsGCRule
 from google.cloud.bigtable.table import Table
 from google.cloud.bigtable.row_set import RowSet
 from google.cloud.bigtable.row_data import PartialRowData
 from google.cloud.bigtable.row_filters import RowFilter
-from google.cloud.bigtable.column_family import MaxVersionsGCRule
 
 from . import utils
 from . import BigTableConfig
@@ -70,6 +71,18 @@ class Client(bigtable.Client, ClientWithIDGen, OperationLogger):
         self._graph_meta = graph_meta
         self._version = None
         self._max_row_key_count = config.MAX_ROW_KEY_COUNT
+
+    def _create_column_families(self):
+        f = self._table.column_family("0")
+        f.create()
+        f = self._table.column_family("1", gc_rule=MaxVersionsGCRule(1))
+        f.create()
+        f = self._table.column_family("2")
+        f.create()
+        f = self._table.column_family("3", gc_rule=MaxAgeGCRule(timedelta(days=365)))
+        f.create()
+        f = self._table.column_family("4")
+        f.create()
 
     @property
     def graph_meta(self):
@@ -628,16 +641,6 @@ class Client(bigtable.Client, ClientWithIDGen, OperationLogger):
         return utils.get_google_compatible_time_stamp(time_stamp, round_up=round_up)
 
     # PRIVATE METHODS
-    def _create_column_families(self):
-        f = self._table.column_family("0")
-        f.create()
-        f = self._table.column_family("1", gc_rule=MaxVersionsGCRule(1))
-        f.create()
-        f = self._table.column_family("2")
-        f.create()
-        f = self._table.column_family("3")
-        f.create()
-
     def _get_ids_range(self, key: bytes, size: int) -> typing.Tuple:
         """Returns a range (min, max) of IDs for a given `key`."""
         column = attributes.Concurrency.Counter

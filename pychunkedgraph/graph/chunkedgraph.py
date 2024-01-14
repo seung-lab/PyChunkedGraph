@@ -1,4 +1,4 @@
-# pylint: disable=invalid-name, missing-docstring, too-many-lines, import-outside-toplevel
+# pylint: disable=invalid-name, missing-docstring, too-many-lines, import-outside-toplevel, unsupported-binary-operation
 
 import time
 import typing
@@ -24,6 +24,8 @@ from .edges import Edges
 from .edges import utils as edge_utils
 from .chunks import utils as chunk_utils
 from .chunks import hierarchy as chunk_hierarchy
+from .subgraph import get_subgraph_nodes
+from .subgraph import get_subgraph_edges_and_leaves
 
 
 class ChunkedGraph:
@@ -112,13 +114,15 @@ class ChunkedGraph:
         """Read all nodes in a chunk."""
         layer = self.get_chunk_layer(chunk_id)
         root_chunk = layer == self.meta.layer_count
-        max_node_id = self.id_client.get_max_node_id(chunk_id=chunk_id, root_chunk=root_chunk)
+        max_id = self.id_client.get_max_node_id(
+            chunk_id=chunk_id, root_chunk=root_chunk
+        )
         if layer == 1:
-            max_node_id = chunk_id | self.get_segment_id_limit(chunk_id) # pylint: disable=unsupported-binary-operation
+            max_id = chunk_id | self.get_segment_id_limit(chunk_id)
 
         return self.client.read_nodes(
             start_id=self.get_node_id(np.uint64(0), chunk_id=chunk_id),
-            end_id=max_node_id,
+            end_id=max_id,
             end_id_inclusive=True,
             properties=properties,
             end_time=time_stamp,
@@ -290,20 +294,57 @@ class ChunkedGraph:
             }
         return self.cache.children_multiple(node_ids)
 
-    def get_atomic_cross_edges(
-        self, l2_ids: typing.Iterable, *, raw_only=False
-    ) -> typing.Dict[np.uint64, typing.Dict[int, typing.Iterable]]:
-        """Returns cross edges for level 2 IDs."""
+    def get_atomic_cross_edges(self, l2_ids: typing.Iterable) -> typing.Dict:
+        """
+        Returns atomic cross edges for level 2 IDs.
+        A dict of the form `{l2id: {layer: atomic_cross_edges}}`.
+        """
+        node_edges_d_d = self.client.read_nodes(
+            node_ids=l2_ids,
+            properties=[
+                attributes.Connectivity.AtomicCrossChunkEdge[l]
+                for l in range(2, max(3, self.meta.layer_count))
+            ],
+        )
+        result = {}
+        for id_ in l2_ids:
+            try:
+                result[id_] = {
+                    prop.index: val[0].value.copy()
+                    for prop, val in node_edges_d_d[id_].items()
+                }
+            except KeyError:
+                result[id_] = {}
+        return result
+
+    def get_cross_chunk_edges(
+        self,
+        node_ids: typing.Iterable,
+        *,
+        raw_only=False,
+        time_stamp: typing.Optional[datetime.datetime] = None,
+    ) -> typing.Dict:
+        """
+        Returns cross edges for `node_ids`.
+        A dict of the form `{node_id: {layer: cross_edges}}`.
+        """
+        time_stamp = misc_utils.get_valid_timestamp(time_stamp)
         if raw_only or not self.cache:
-            node_edges_d_d = self.client.read_nodes(
-                node_ids=l2_ids,
-                properties=[
-                    attributes.Connectivity.CrossChunkEdge[l]
-                    for l in range(2, max(3, self.meta.layer_count))
-                ],
-            )
             result = {}
-            for id_ in l2_ids:
+            node_ids = np.array(node_ids, dtype=basetypes.NODE_ID)
+            if node_ids.size == 0:
+                return result
+            attrs = [
+                attributes.Connectivity.CrossChunkEdge[l]
+                for l in range(2, max(3, self.meta.layer_count))
+            ]
+            node_edges_d_d = self.client.read_nodes(
+                node_ids=node_ids,
+                properties=attrs,
+                end_time=time_stamp,
+                end_time_inclusive=True,
+            )
+            for id_ in node_ids:
                 try:
                     result[id_] = {
                         prop.index: val[0].value.copy()
@@ -312,68 +353,7 @@ class ChunkedGraph:
                 except KeyError:
                     result[id_] = {}
             return result
-        return self.cache.atomic_cross_edges_multiple(l2_ids)
-
-    def get_cross_chunk_edges(
-        self, node_ids: typing.Iterable, uplift=True, all_layers=False
-    ) -> typing.Dict[np.uint64, typing.Dict[int, typing.Iterable]]:
-        """
-        Cross chunk edges for `node_id` at `node_layer`.
-        The edges are between node IDs at the `node_layer`, not atomic cross edges.
-        Returns dict {layer_id: cross_edges}
-            The first layer (>= `node_layer`) with atleast one cross chunk edge.
-            For current use-cases, other layers are not relevant.
-
-        For performance, only children that lie along chunk boundary are considered.
-        Cross edges that belong to inner level 2 IDs are subsumed within the chunk.
-        This is because cross edges are stored only in level 2 IDs.
-        """
-        result = {}
-        node_ids = np.array(node_ids, dtype=basetypes.NODE_ID)
-        if not node_ids.size:
-            return result
-
-        node_l2ids_d = {}
-        layers_ = self.get_chunk_layers(node_ids)
-        for l in set(layers_):
-            node_l2ids_d.update(self._get_bounding_l2_children(node_ids[layers_ == l]))
-        l2_edges_d_d = self.get_atomic_cross_edges(
-            np.concatenate(list(node_l2ids_d.values()))
-        )
-        for node_id in node_ids:
-            l2_edges_ds = [l2_edges_d_d[l2_id] for l2_id in node_l2ids_d[node_id]]
-            if all_layers:
-                result[node_id] = edge_utils.concatenate_cross_edge_dicts(l2_edges_ds)
-            else:
-                result[node_id] = self._get_min_layer_cross_edges(
-                    node_id, l2_edges_ds, uplift=uplift
-                )
-        return result
-
-    def _get_min_layer_cross_edges(
-        self,
-        node_id: basetypes.NODE_ID,
-        l2id_atomic_cross_edges_ds: typing.Iterable,
-        uplift=True,
-    ) -> typing.Dict[int, typing.Iterable]:
-        """
-        Find edges at relevant min_layer >= node_layer.
-        `l2id_atomic_cross_edges_ds` is a list of atomic cross edges of
-        level 2 IDs that are descendants of `node_id`.
-        """
-        min_layer, edges = edge_utils.filter_min_layer_cross_edges_multiple(
-            self.meta, l2id_atomic_cross_edges_ds, self.get_chunk_layer(node_id)
-        )
-        if self.get_chunk_layer(node_id) < min_layer:
-            # cross edges irrelevant
-            return {self.get_chunk_layer(node_id): types.empty_2d}
-        if not uplift:
-            return {min_layer: edges}
-        node_root_id = node_id
-        node_root_id = self.get_root(node_id, stop_layer=min_layer, ceil=False)
-        edges[:, 0] = node_root_id
-        edges[:, 1] = self.get_roots(edges[:, 1], stop_layer=min_layer, ceil=False)
-        return {min_layer: np.unique(edges, axis=0) if edges.size else types.empty_2d}
+        return self.cache.cross_chunk_edges_multiple(node_ids, time_stamp=time_stamp)
 
     def get_roots(
         self,
@@ -384,6 +364,7 @@ class ChunkedGraph:
         stop_layer: int = None,
         ceil: bool = True,
         fail_to_zero: bool = False,
+        raw_only=False,
         n_tries: int = 1,
     ) -> typing.Union[np.ndarray, typing.Dict[int, np.ndarray]]:
         """
@@ -407,7 +388,10 @@ class ChunkedGraph:
                 filtered_ids = parent_ids[layer_mask]
                 unique_ids, inverse = np.unique(filtered_ids, return_inverse=True)
                 temp_ids = self.get_parents(
-                    unique_ids, time_stamp=time_stamp, fail_to_zero=fail_to_zero
+                    unique_ids,
+                    time_stamp=time_stamp,
+                    fail_to_zero=fail_to_zero,
+                    raw_only=raw_only,
                 )
                 if not temp_ids.size:
                     break
@@ -462,6 +446,7 @@ class ChunkedGraph:
         get_all_parents: bool = False,
         stop_layer: int = None,
         ceil: bool = True,
+        raw_only: bool = False,
         n_tries: int = 1,
     ) -> typing.Union[typing.List[np.uint64], np.uint64]:
         """Takes a node id and returns the associated agglomeration ids."""
@@ -479,7 +464,9 @@ class ChunkedGraph:
         for _ in range(n_tries):
             parent_id = node_id
             for _ in range(self.get_chunk_layer(node_id), int(stop_layer + 1)):
-                temp_parent_id = self.get_parent(parent_id, time_stamp=time_stamp)
+                temp_parent_id = self.get_parent(
+                    parent_id, time_stamp=time_stamp, raw_only=raw_only
+                )
                 if temp_parent_id is None:
                     break
                 else:
@@ -551,17 +538,18 @@ class ChunkedGraph:
         node_id_or_ids: typing.Union[np.uint64, typing.Iterable],
         bbox: typing.Optional[typing.Sequence[typing.Sequence[int]]] = None,
         bbox_is_coordinate: bool = False,
-        return_layers: typing.List = [2],
+        return_layers: typing.List = None,
         nodes_only: bool = False,
         edges_only: bool = False,
         leaves_only: bool = False,
         return_flattened: bool = False,
-    ) -> typing.Tuple[typing.Dict, typing.Dict, Edges]:
+    ) -> typing.Tuple[typing.Dict, typing.Tuple[Edges]]:
         """
         Generic subgraph method.
         """
-        from .subgraph import get_subgraph_nodes
-        from .subgraph import get_subgraph_edges_and_leaves
+
+        if return_layers is None:
+            return_layers = [2]
 
         if nodes_only:
             return get_subgraph_nodes(
@@ -581,7 +569,7 @@ class ChunkedGraph:
         node_id_or_ids: typing.Union[np.uint64, typing.Iterable],
         bbox: typing.Optional[typing.Sequence[typing.Sequence[int]]] = None,
         bbox_is_coordinate: bool = False,
-        return_layers: typing.List = [2],
+        return_layers: typing.List = None,
         serializable: bool = False,
         return_flattened: bool = False,
     ) -> typing.Tuple[typing.Dict, typing.Dict, Edges]:
@@ -589,7 +577,8 @@ class ChunkedGraph:
         Get the children of `node_ids` that are at each of
         return_layers within the specified bounding box.
         """
-        from .subgraph import get_subgraph_nodes
+        if return_layers is None:
+            return_layers = [2]
 
         return get_subgraph_nodes(
             self,
@@ -610,8 +599,6 @@ class ChunkedGraph:
         """
         Get the atomic edges of the `node_ids` within the specified bounding box.
         """
-        from .subgraph import get_subgraph_edges_and_leaves
-
         return get_subgraph_edges_and_leaves(
             self, node_id_or_ids, bbox, bbox_is_coordinate, True, False
         )
@@ -625,8 +612,6 @@ class ChunkedGraph:
         """
         Get the supervoxels of the `node_ids` within the specified bounding box.
         """
-        from .subgraph import get_subgraph_edges_and_leaves
-
         return get_subgraph_edges_and_leaves(
             self, node_id_or_ids, bbox, bbox_is_coordinate, False, True
         )
@@ -644,14 +629,14 @@ class ChunkedGraph:
         )
         for id_, val in fake_edges_d.items():
             edges = np.concatenate(
-                [np.array(e.value, dtype=basetypes.NODE_ID) for e in val]
+                [np.array(e.value, dtype=basetypes.NODE_ID, copy=False) for e in val]
             )
             result[id_] = Edges(edges[:, 0], edges[:, 1], fake_edges=True)
         return result
 
     def get_l2_agglomerations(
         self, level2_ids: np.ndarray, edges_only: bool = False
-    ) -> typing.Tuple[typing.Dict[int, types.Agglomeration], np.ndarray]:
+    ) -> typing.Tuple[typing.Dict[int, types.Agglomeration], typing.Tuple[Edges]]:
         """
         Children of Level 2 Node IDs and edges.
         Edges are read from cloud storage.
@@ -674,6 +659,8 @@ class ChunkedGraph:
             chain(edges_d.values(), fake_edges.values()),
             Edges([], []),
         )
+        if self.mock_edges is not None:
+            all_chunk_edges += self.mock_edges
 
         if edges_only:
             if self.mock_edges is not None:
@@ -689,12 +676,13 @@ class ChunkedGraph:
         sv_parent_d = {}
         for l2id in l2id_children_d:
             svs = l2id_children_d[l2id]
+            for sv in svs:
+                if sv in sv_parent_d:
+                    raise ValueError("Found conflicting parents.")
             sv_parent_d.update(dict(zip(svs.tolist(), [l2id] * len(svs))))
 
         in_edges, out_edges, cross_edges = edge_utils.categorize_edges_v2(
-            self.meta,
-            all_chunk_edges,
-            sv_parent_d
+            self.meta, all_chunk_edges, sv_parent_d
         )
 
         agglomeration_d = get_agglomerations(
@@ -842,82 +830,7 @@ class ChunkedGraph:
             multicut_as_split=True,
         ).execute()
 
-    # PRIVATE
-
-    def _get_bounding_chunk_ids(
-        self,
-        parent_chunk_ids: typing.Iterable,
-        unique: bool = False,
-    ) -> typing.Dict:
-        """
-        Returns bounding chunk IDs at layers < parent_layer for all chunk IDs.
-        Dict[parent_chunk_id] = np.array(bounding_chunk_ids)
-        """
-        parent_chunk_coords = self.get_chunk_coordinates_multiple(parent_chunk_ids)
-        parents_layer = self.get_chunk_layer(parent_chunk_ids[0])
-        chunk_id_bchunk_ids_d = {}
-        for i, chunk_id in enumerate(parent_chunk_ids):
-            if chunk_id in chunk_id_bchunk_ids_d:
-                # `parent_chunk_ids` can have duplicates
-                # avoid redundant calculations
-                continue
-            parent_coord = parent_chunk_coords[i]
-            chunk_ids = [types.empty_1d]
-            for child_layer in range(2, parents_layer):
-                bcoords = chunk_utils.get_bounding_children_chunks(
-                    self.meta,
-                    parents_layer,
-                    parent_coord,
-                    child_layer,
-                    return_unique=False,
-                )
-                bchunks_ids = chunk_utils.get_chunk_ids_from_coords(
-                    self.meta, child_layer, bcoords
-                )
-                chunk_ids.append(bchunks_ids)
-            chunk_ids = np.concatenate(chunk_ids)
-            if unique:
-                chunk_ids = np.unique(chunk_ids)
-            chunk_id_bchunk_ids_d[chunk_id] = chunk_ids
-        return chunk_id_bchunk_ids_d
-
-    def _get_bounding_l2_children(self, parents: typing.Iterable) -> typing.Dict:
-        parent_chunk_ids = self.get_chunk_ids_from_node_ids(parents)
-        chunk_id_bchunk_ids_d = self._get_bounding_chunk_ids(
-            parent_chunk_ids, unique=len(parents) >= 200
-        )
-
-        parent_descendants_d = {
-            _id: np.array([_id], dtype=basetypes.NODE_ID) for _id in parents
-        }
-        descendants_all = np.concatenate(list(parent_descendants_d.values()))
-        descendants_layers = self.get_chunk_layers(descendants_all)
-        layer_mask = descendants_layers > 2
-        descendants_all = descendants_all[layer_mask]
-
-        while descendants_all.size:
-            descendant_children_d = self.get_children(descendants_all)
-            for i, parent_id in enumerate(parents):
-                _descendants = parent_descendants_d[parent_id]
-                _layers = self.get_chunk_layers(_descendants)
-                _l2mask = _layers == 2
-                descendants = [_descendants[_l2mask]]
-                for child in _descendants[~_l2mask]:
-                    descendants.append(descendant_children_d[child])
-                descendants = np.concatenate(descendants)
-                chunk_ids = self.get_chunk_ids_from_node_ids(descendants)
-                bchunk_ids = chunk_id_bchunk_ids_d[parent_chunk_ids[i]]
-                bounding_descendants = descendants[np.in1d(chunk_ids, bchunk_ids)]
-                parent_descendants_d[parent_id] = bounding_descendants
-
-            descendants_all = np.concatenate(list(parent_descendants_d.values()))
-            descendants_layers = self.get_chunk_layers(descendants_all)
-            layer_mask = descendants_layers > 2
-            descendants_all = descendants_all[layer_mask]
-        return parent_descendants_d
-
     # HELPERS / WRAPPERS
-
     def is_root(self, node_id: basetypes.NODE_ID) -> bool:
         return self.get_chunk_layer(node_id) == self.meta.layer_count
 
@@ -955,7 +868,9 @@ class ChunkedGraph:
         return chunk_utils.get_chunk_coordinates(self.meta, node_or_chunk_id)
 
     def get_chunk_coordinates_multiple(self, node_or_chunk_ids: typing.Sequence):
-        node_or_chunk_ids = np.array(node_or_chunk_ids, dtype=basetypes.NODE_ID)
+        node_or_chunk_ids = np.array(
+            node_or_chunk_ids, dtype=basetypes.NODE_ID, copy=False
+        )
         layers = self.get_chunk_layers(node_or_chunk_ids)
         assert np.all(layers == layers[0]), "All IDs must have the same layer."
         return chunk_utils.get_chunk_coordinates_multiple(self.meta, node_or_chunk_ids)
