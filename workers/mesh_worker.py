@@ -3,7 +3,6 @@
 import gc
 import pickle
 import logging
-from os import path
 from os import getenv
 
 import numpy as np
@@ -12,6 +11,7 @@ from messagingclient import MessagingClient
 from pychunkedgraph.graph import ChunkedGraph
 from pychunkedgraph.graph.utils import basetypes
 from pychunkedgraph.meshing import meshgen
+from pychunkedgraph.meshing.manifest.utils import get_unsharded_mesh_path
 
 
 PCG_CACHE = {}
@@ -28,12 +28,6 @@ def callback(payload):
     except KeyError:
         cg = ChunkedGraph(graph_id=table_id)
         PCG_CACHE[table_id] = cg
-
-    mesh_dir = cg.meta.dataset_info["mesh"]
-    cv_unsharded_mesh_dir = cg.meta.dataset_info["mesh_metadata"]["unsharded_mesh_dir"]
-    mesh_path = path.join(
-        cg.meta.data_source.WATERSHED, mesh_dir, cv_unsharded_mesh_dir
-    )
 
     try:
         mesh_data = cg.meta.custom_data["mesh"]
@@ -56,8 +50,8 @@ def callback(payload):
         stop_layer=layer,
         mip=mip,
         max_err=err,
-        cv_sharded_mesh_dir=mesh_dir,
-        cv_unsharded_mesh_path=mesh_path,
+        cv_sharded_mesh_dir=cg.meta.dataset_info["mesh"],
+        cv_unsharded_mesh_path=get_unsharded_mesh_path(cg),
     )
     logging.log(INFO_HIGH, f"remeshing complete; graph {table_id} operation {op_id}.")
     gc.collect()

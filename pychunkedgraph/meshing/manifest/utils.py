@@ -99,15 +99,20 @@ def _get_initial_meshes(
     return result
 
 
+def get_unsharded_mesh_path(cg) -> str:
+    mesh_meta = cg.meta.custom_data.get("mesh", {})
+    mesh_dir = mesh_meta.get("dir", "graphene_meshes")
+    sub_dir = mesh_meta.get("sub_dir", "dynamic")
+    return f"{cg.meta.data_source.WATERSHED}/{mesh_dir}/{sub_dir}"
+
+
 def _get_dynamic_meshes(cg, node_ids: Sequence[np.uint64]) -> Tuple[Dict, List]:
     result = {}
     not_existing = []
     if len(node_ids) == 0:
         return result, not_existing
 
-    mesh_dir = cg.meta.custom_data.get("mesh", {}).get("dir", "graphene_meshes")
-    mesh_path = f"{cg.meta.data_source.WATERSHED}/{mesh_dir}/dynamic"
-    cf = CloudFiles(mesh_path)
+    cf = CloudFiles(get_unsharded_mesh_path(cg))
     manifest_cache = ManifestCache(cg.graph_id, initial=False)
 
     result_, not_cached, not_existing_ = manifest_cache.get_fragments(node_ids)
