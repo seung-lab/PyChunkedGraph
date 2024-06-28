@@ -1,16 +1,28 @@
+# pylint: disable=invalid-name, missing-function-docstring, unspecified-encoding
+
 """
 cli for running ingest
 """
+
+import logging
 
 import click
 import yaml
 from flask.cli import AppGroup
 
+from .cluster import create_atomic_chunk, create_parent_chunk, enqueue_l2_tasks
 from .manager import IngestionManager
-from .utils import bootstrap
+from .utils import (
+    bootstrap,
+    chunk_id_str,
+    print_completion_rate,
+    print_ingest_status,
+    queue_layer_helper,
+)
+from .simple_tests import run_all
+from .create.parent_layer import add_parent_chunk
 from ..graph.chunkedgraph import ChunkedGraph
-from ..utils.redis import get_redis_connection
-from ..utils.redis import keys as r_keys
+from ..utils.redis import get_redis_connection, keys as r_keys
 
 ingest_cli = AppGroup("ingest")
 
@@ -29,9 +41,9 @@ def flush_redis():
 @ingest_cli.command("graph")
 @click.argument("graph_id", type=str)
 @click.argument("dataset", type=click.Path(exists=True))
-@click.option("--raw", is_flag=True)
-@click.option("--test", is_flag=True)
-@click.option("--retry", is_flag=True)
+@click.option("--raw", is_flag=True, help="Read edges from agglomeration output.")
+@click.option("--test", is_flag=True, help="Test 8 chunks at the center of dataset.")
+@click.option("--retry", is_flag=True, help="Rerun without creating a new table.")
 def ingest_graph(
     graph_id: str, dataset: click.Path, raw: bool, test: bool, retry: bool
 ):
@@ -39,21 +51,19 @@ def ingest_graph(
     Main ingest command.
     Takes ingest config from a yaml file and queues atomic tasks.
     """
-    from .cluster import enqueue_atomic_tasks
-
     with open(dataset, "r") as stream:
         config = yaml.safe_load(stream)
 
-    meta, ingest_config, client_info = bootstrap(
-        graph_id,
-        config=config,
-        raw=raw,
-        test_run=test,
-    )
+    if test:
+        logging.basicConfig(format="%(levelname)s:%(message)s", level=logging.DEBUG)
+
+    meta, ingest_config, client_info = bootstrap(graph_id, config, raw, test)
     cg = ChunkedGraph(meta=meta, client_info=client_info)
     if not retry:
         cg.create()
-    enqueue_atomic_tasks(IngestionManager(ingest_config, meta))
+
+    imanager = IngestionManager(ingest_config, meta)
+    enqueue_l2_tasks(imanager, create_atomic_chunk)
 
 
 @ingest_cli.command("imanager")
@@ -73,7 +83,7 @@ def pickle_imanager(graph_id: str, dataset: click.Path, raw: bool):
 
     meta, ingest_config, _ = bootstrap(graph_id, config=config, raw=raw)
     imanager = IngestionManager(ingest_config, meta)
-    imanager.redis
+    imanager.redis  # pylint: disable=pointless-statement
 
 
 @ingest_cli.command("layer")
@@ -83,31 +93,10 @@ def queue_layer(parent_layer):
     Queue all chunk tasks at a given layer.
     Must be used when all the chunks at `parent_layer - 1` have completed.
     """
-    from itertools import product
-    import numpy as np
-    from .cluster import create_parent_chunk
-    from .utils import chunk_id_str
-
     assert parent_layer > 2, "This command is for layers 3 and above."
     redis = get_redis_connection()
     imanager = IngestionManager.from_pickle(redis.get(r_keys.INGESTION_MANAGER))
-
-    if parent_layer == imanager.cg_meta.layer_count:
-        chunk_coords = [(0, 0, 0)]
-    else:
-        bounds = imanager.cg_meta.layer_chunk_bounds[parent_layer]
-        chunk_coords = list(product(*[range(r) for r in bounds]))
-        np.random.shuffle(chunk_coords)
-
-    for coords in chunk_coords:
-        task_q = imanager.get_task_queue(f"l{parent_layer}")
-        task_q.enqueue(
-            create_parent_chunk,
-            job_id=chunk_id_str(parent_layer, coords),
-            job_timeout=f"{int(parent_layer * parent_layer)}m",
-            result_ttl=0,
-            args=(parent_layer, coords),
-        )
+    queue_layer_helper(parent_layer, imanager, create_parent_chunk)
 
 
 @ingest_cli.command("status")
@@ -115,10 +104,7 @@ def ingest_status():
     """Print ingest status to console by layer."""
     redis = get_redis_connection()
     imanager = IngestionManager.from_pickle(redis.get(r_keys.INGESTION_MANAGER))
-    layers = range(2, imanager.cg_meta.layer_count + 1)
-    for layer, layer_count in zip(layers, imanager.cg_meta.layer_chunk_counts):
-        completed = redis.scard(f"{layer}c")
-        print(f"{layer}\t: {completed} / {layer_count}")
+    print_ingest_status(imanager, redis)
 
 
 @ingest_cli.command("chunk")
@@ -126,21 +112,16 @@ def ingest_status():
 @click.argument("chunk_info", nargs=4, type=int)
 def ingest_chunk(queue: str, chunk_info):
     """Manually queue chunk when a job is stuck for whatever reason."""
-    from .cluster import _create_atomic_chunk
-    from .cluster import create_parent_chunk
-    from .utils import chunk_id_str
-
     redis = get_redis_connection()
     imanager = IngestionManager.from_pickle(redis.get(r_keys.INGESTION_MANAGER))
-    layer = chunk_info[0]
-    coords = chunk_info[1:]
-    queue = imanager.get_task_queue(queue)
+    layer, coords = chunk_info[0], chunk_info[1:]
+
+    func = create_parent_chunk
+    args = (layer, coords)
     if layer == 2:
-        func = _create_atomic_chunk
+        func = create_atomic_chunk
         args = (coords,)
-    else:
-        func = create_parent_chunk
-        args = (layer, coords)
+    queue = imanager.get_task_queue(queue)
     queue.enqueue(
         func,
         job_id=chunk_id_str(layer, coords),
@@ -156,11 +137,26 @@ def ingest_chunk(queue: str, chunk_info):
 @click.option("--n_threads", type=int, default=1)
 def ingest_chunk_local(graph_id: str, chunk_info, n_threads: int):
     """Manually ingest a chunk on a local machine."""
-    from .create.abstract_layers import add_layer
-    from .cluster import _create_atomic_chunk
-
-    if chunk_info[0] == 2:
-        _create_atomic_chunk(chunk_info[1:])
+    layer, coords = chunk_info[0], chunk_info[1:]
+    if layer == 2:
+        create_atomic_chunk(coords)
     else:
         cg = ChunkedGraph(graph_id=graph_id)
-        add_layer(cg, chunk_info[0], chunk_info[1:], n_threads=n_threads)
+        add_parent_chunk(cg, layer, coords, n_threads=n_threads)
+    cg = ChunkedGraph(graph_id=graph_id)
+    add_parent_chunk(cg, layer, coords, n_threads=n_threads)
+
+
+@ingest_cli.command("rate")
+@click.argument("layer", type=int)
+@click.option("--span", default=10, help="Time span to calculate rate.")
+def rate(layer: int, span: int):
+    redis = get_redis_connection()
+    imanager = IngestionManager.from_pickle(redis.get(r_keys.INGESTION_MANAGER))
+    print_completion_rate(imanager, layer, span=span)
+
+
+@ingest_cli.command("run_tests")
+@click.argument("graph_id", type=str)
+def run_tests(graph_id):
+    run_all(ChunkedGraph(graph_id=graph_id))

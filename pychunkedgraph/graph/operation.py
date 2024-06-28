@@ -1,4 +1,4 @@
-# pylint: disable=invalid-name, missing-docstring, too-many-lines, protected-access
+# pylint: disable=invalid-name, missing-docstring, too-many-lines, protected-access, broad-exception-raised
 
 from abc import ABC, abstractmethod
 from collections import namedtuple
@@ -457,6 +457,9 @@ class GraphEditOperation(ABC):
             except PostconditionError as err:
                 self.cg.cache = None
                 raise PostconditionError(err) from err
+            except (AssertionError, RuntimeError) as err:
+                self.cg.cache = None
+                raise RuntimeError(err) from err
             except Exception as err:
                 # unknown exception, update log record with error
                 self.cg.cache = None
@@ -469,7 +472,7 @@ class GraphEditOperation(ABC):
                     exception=repr(err),
                 )
                 self.cg.client.write([log_record_error])
-                raise Exception(err)
+                raise Exception(err) from err
 
             with TimeIt(f"{op_type}.write", self.cg.graph_id, lock.operation_id):
                 result = self._write(
@@ -892,11 +895,11 @@ class MulticutOperation(GraphEditOperation):
             self.cg.meta.split_bounding_offset,
         )
         with TimeIt("get_subgraph", self.cg.graph_id, operation_id):
-            l2id_agglomeration_d, edges = self.cg.get_subgraph(
+            l2id_agglomeration_d, edges_tuple = self.cg.get_subgraph(
                 root_ids.pop(), bbox=bbox, bbox_is_coordinate=True
             )
 
-            edges = reduce(lambda x, y: x + y, edges, Edges([], []))
+            edges = reduce(lambda x, y: x + y, edges_tuple, Edges([], []))
             supervoxels = np.concatenate(
                 [agg.supervoxels for agg in l2id_agglomeration_d.values()]
             )
